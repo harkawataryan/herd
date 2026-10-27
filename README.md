@@ -1,119 +1,114 @@
 # Herd
 
-One OpenAI-compatible endpoint in front of your own model servers, routed by live KV-cache and prefix-cache signals, with budgeted spillover to hosted providers when local capacity runs out.
+An OpenAI-compatible gateway that sits in front of your own model servers (vLLM, llama.cpp, Ollama) and picks which replica gets each request based on live KV-cache usage and prefix-cache affinity. When everything is full it sheds low-priority requests, queues the rest fairly across tenants, and can spill over to a hosted provider within a per-tenant budget.
 
-Point anything that speaks the OpenAI API (Cursor, Open WebUI, LangChain, a curl) at Herd instead of at a single vLLM, llama.cpp or Ollama instance. Herd pools the replicas and, for every request, picks the one that will answer fastest: the replica with KV-cache headroom, or the one that already has this prompt's prefix cached and can skip prefill. When every replica is saturated it sheds low-priority traffic, queues normal traffic fairly across tenants, and spills critical traffic (or anything with budget) to a cloud provider. Every decision is visible in a live dashboard and in Prometheus.
+I built it after a summer working on utilization-based load balancing in a service mesh and wanting to see how the same idea plays out for LLM serving, where request cost depends on prompt length and on what's already cached, and where a replica with a free connection can still be out of KV memory. Round-robin and least-connections can't see any of that.
 
-## Why
+Point anything that speaks the OpenAI chat API at it (Cursor, Open WebUI, LangChain, curl). Every routing decision shows up in a live dashboard and in Prometheus.
 
-Load balancing for model servers is not load balancing for web servers. A request's cost depends on its prompt length and on whether the server already holds its prefix in cache; a replica with a free connection slot can still be out of KV-cache memory; and time to first token, which is what a user feels, collapses the moment a replica starts queueing internally. Round-robin and least-connections can't see any of that. Herd routes on the signals that matter, the way GKE Inference Gateway and similar systems do, and measures the difference.
+## Benchmark results
 
-## Results
-
-Eight simulated replicas (32k-token KV cache, batch 16), a shared-context workload (a pool of 20 large system prompts with Zipf popularity, short user turns, 30% with extra retrieved context), Poisson arrivals at 7 requests/s, identical seeded trace for every policy. `bench/run.sh` reproduces this in about 40 seconds.
+8 simulated replicas (32k-token KV cache, batch size 16), a workload of 20 large shared system prompts with Zipf popularity and short user turns, Poisson arrivals at 7 req/s. Same seeded trace for each policy. `bench/run.sh` reproduces it in about 40 seconds.
 
 | policy | p50 TTFT | p95 TTFT | p99 TTFT | p99 end-to-end | prefix hits |
 |---|---|---|---|---|---|
 | round_robin | 1460 ms | 5080 ms | 10040 ms | 15920 ms | 0% |
 | least_queue | 1040 ms | 3780 ms | 6240 ms | 11160 ms | 0% |
 | kv_aware | 1120 ms | 4120 ms | 5560 ms | 11080 ms | 0% |
-| **prefix_aware** | **740 ms** | **2760 ms** | **4480 ms** | **10080 ms** | 82% |
+| prefix_aware | 740 ms | 2760 ms | 4480 ms | 10080 ms | 82% |
 
-Prefix-aware routing cuts p99 time to first token by 55% and p50 by 49% against round-robin at the same throughput, with no shedding.
+prefix_aware cuts p99 time-to-first-token by 55% vs round-robin at the same throughput, no shedding.
 
-With two of the eight replicas at half capacity (`bench/hetero.sh`, 6 req/s), static balancing falls apart while live signals route around the weak replicas:
+With two of the eight replicas at half capacity (`bench/hetero.sh`, 6 req/s), round-robin keeps sending the weak replicas a full share and their queues never drain:
 
-| policy | p50 TTFT | p99 TTFT | share sent to each weak replica |
+| policy | p50 TTFT | p99 TTFT | traffic to each weak replica |
 |---|---|---|---|
 | round_robin | 1480 ms | 292140 ms | 12.4% |
 | least_queue | 1220 ms | 23440 ms | ~5% |
 | kv_aware | 1140 ms | 12560 ms | 4.4% |
 | prefix_aware | 1080 ms | 13480 ms | 4.9% |
 
-Full tables with throughput, shed and spillover rates: [`bench/results.md`](bench/results.md), [`bench/results-hetero.md`](bench/results-hetero.md). Methodology and caveats: [`docs/benchmarks.md`](docs/benchmarks.md).
+Full tables: [bench/results.md](bench/results.md), [bench/results-hetero.md](bench/results-hetero.md). How the workload and simulator are set up, and what the numbers do and don't mean: [docs/benchmarks.md](docs/benchmarks.md).
 
 ## How it works
 
 ```
 clients ──HTTP/SSE──▶ gateway ─┬─▶ replica 1 (vLLM / llama.cpp / Ollama / simulator)
-                      │        ├─▶ replica 2            each scraped for KV-cache and queue gauges
-   tenant + criticality        └─▶ cloud provider        (spillover, priced per token, budgeted)
+                      │        ├─▶ replica 2            /metrics scraped for KV and queue gauges
+   tenant + criticality        └─▶ cloud provider        (priced per token, per-tenant budget)
    ▼
    saturated? ── no ──▶ policy picks a replica ──▶ streaming proxy, TTFT/TPOT measured
        │ yes
        ├─ sheddable ──▶ 503 + Retry-After
-       ├─ critical  ──▶ cloud spillover (or least-loaded replica if no provider)
-       └─ standard  ──▶ cloud if the tenant has budget, else fair queue until a replica frees
+       ├─ critical  ──▶ cloud (or least-loaded replica if there's no provider)
+       └─ standard  ──▶ cloud if the tenant has budget, otherwise fair queue
 ```
 
-**Signals.** Every 500 ms the gateway scrapes each replica's `/metrics` for `vllm:gpu_cache_usage_perc` and `vllm:num_requests_waiting` (llama.cpp's names are understood too). Between scrapes it adds the tokens it has dispatched since, so the estimate doesn't go stale. A replica's load score is `0.6 × KV estimate + 0.4 × in-flight / batch`, and a full batch or a non-empty server-side queue scores 1.
+**Load signal.** Every 500ms the gateway scrapes each replica's `/metrics` for `vllm:gpu_cache_usage_perc` and `vllm:num_requests_waiting` (llama.cpp's metric names work too). Between scrapes it adds the tokens it has sent since, so the estimate stays current. Load score = `0.6 × KV estimate + 0.4 × inflight/batch`; a full batch or a non-empty server queue counts as 1.
 
-**Prefix affinity.** Prompts are hashed in 256-character blocks with each hash folded over the previous one, the same scheme servers use for prefix caching. The gateway keeps an LRU index of which block chains it has sent to which replica. `prefix_aware` sends a request to the replica with the longest matching chain unless that replica's score is above 0.8, in which case it falls back to the least-loaded replica; a tiny hysteresis stops it flapping.
+**Prefix affinity.** Prompts are hashed in 256-char blocks, each hash chained to the previous one, which is how servers key their prefix caches. The gateway keeps an LRU index of which chains went to which replica. `prefix_aware` picks the replica with the longest match unless its load score is over 0.8, then falls back to the least loaded one. There's a small hysteresis so it doesn't flap.
 
-**Saturation handling.** Criticality comes from the `X-Criticality` header (`critical`, `standard`, `sheddable`). Tenants are identified by API key and carry a weight and a cloud budget. The queue releases critical requests first and shares freed capacity across tenants by deficit round robin.
+**Saturation.** Requests carry `X-Criticality: critical|standard|sheddable`. Tenants are identified by API key and have a weight and a cloud budget. The queue releases critical requests first and splits freed capacity across tenants with deficit round robin.
 
-**Spillover.** Providers are configured with per-token prices and a model mapping (`llama-3-8b → gpt-4o-mini`). Spend is tracked per tenant and stops at the budget.
+**Spillover.** Providers are configured with per-token prices and a model mapping (e.g. `llama-3-8b → gpt-4o-mini`). Spend is tracked per tenant and stops at the budget.
 
-**Envoy mode.** `cmd/extproc` exposes the same scheduler as an Envoy external processor: Envoy buffers the body, asks Herd for an endpoint, and an `ORIGINAL_DST` cluster forwards the request there. That is the shape of the Kubernetes Gateway API Inference Extension, so the routing can live inside an existing mesh instead of behind an extra hop.
+**Envoy.** `cmd/extproc` runs the same scheduler as an Envoy external processor. Envoy buffers the body, asks for an endpoint, and an `ORIGINAL_DST` cluster sends the request there. Same shape as the Kubernetes Gateway API inference extension, so it can sit inside an existing mesh.
 
-## Run it
+## Running it
 
 ```bash
-# 1. three simulated replicas + a mock cloud provider + the gateway with the dashboard
 go build -o bin/ ./cmd/...
 for i in 1 2 3; do bin/simbackend -addr :900$i -name sim-$i -time-scale 0.1 & done
 bin/simbackend -addr :9101 -name cloud -mode cloud -models gpt-4o-mini &
-cp herd.example.yaml herd.yaml   # edit URLs/ports if needed
-bin/gateway -config herd.yaml    # dashboard at http://localhost:8080
+cp herd.example.yaml herd.yaml
+bin/gateway -config herd.yaml        # dashboard at http://localhost:8080
 
-# 2. talk to it like any OpenAI endpoint
-curl -N localhost:8080/v1/chat/completions -H 'Authorization: Bearer demo-key' -H 'X-Criticality: standard' \
+curl -N localhost:8080/v1/chat/completions -H 'Authorization: Bearer demo-key' \
   -H 'Content-Type: application/json' \
   -d '{"model":"llama-3-8b","stream":true,"messages":[{"role":"user","content":"hello"}]}'
 ```
 
-Responses carry `X-Herd-Backend` and `X-Herd-Reason` so you can see what happened. `GET /admin/backends` and `GET /admin/decisions` feed the dashboard; `GET /metrics` is Prometheus.
+Responses include `X-Herd-Backend` and `X-Herd-Reason`. `/admin/backends` and `/admin/decisions` are what the dashboard reads; `/metrics` is Prometheus.
 
-**Real servers.** Any backend that serves `/v1/chat/completions` works. vLLM exposes the KV-cache gauges Herd scrapes by default; llama.cpp's `llama-server --metrics` does too. Ollama has no KV metrics, so it is routed on in-flight count alone.
+Any server with a `/v1/chat/completions` endpoint works as a backend. vLLM and `llama-server --metrics` expose the KV gauges; Ollama doesn't, so it gets routed on in-flight count only.
 
-**Compose stack** with eight replicas, Prometheus and a Grafana dashboard: `docker compose -f deploy/compose/docker-compose.yml up --build` (gateway :8080, Grafana :3000).
-
-**Kubernetes:** `deploy/k8s/herd.yaml` runs the replicas as a StatefulSet and the gateway as a Deployment with an HPA (CPU by default; `hpa-queue.yaml` scales on `herd_queue_depth` with prometheus-adapter). Tested on kind.
-
-**Envoy:** `bin/extproc -config herd.yaml` then `envoy -c deploy/envoy/envoy.yaml`.
+Other ways to run it:
+- `docker compose -f deploy/compose/docker-compose.yml up --build` for 8 replicas plus Prometheus and Grafana (gateway :8080, Grafana :3000).
+- `deploy/k8s/herd.yaml` has a StatefulSet for replicas, a Deployment for the gateway, and an HPA (CPU by default, `hpa-queue.yaml` for queue depth via prometheus-adapter). Written for kind; I haven't run it on a managed cluster.
+- `bin/extproc -config herd.yaml` then `envoy -c deploy/envoy/envoy.yaml`.
 
 ## Benchmarks
 
 ```bash
-bench/run.sh                 # four policies, identical trace, results.md
-bench/hetero.sh              # two replicas at half capacity
+bench/run.sh
+bench/hetero.sh
 BENCH_RPS=9 BENCH_DURATION=300s bench/run.sh
 LOADGEN_ARGS="-system-chars 4000 -mix short=0.4,rag=0.4,long=0.2" bench/run.sh
 ```
 
-The load generator (`cmd/loadgen`) replays a seeded, recordable trace at a scaled clock so a five-minute run takes fifteen seconds; see `bench/README.md`.
+`cmd/loadgen` replays a seeded trace at a scaled clock, so a 5-minute run takes about 15 seconds. Details in `bench/README.md`.
 
 ## Layout
 
 | path | |
 |---|---|
-| `cmd/gateway` | the gateway binary |
-| `cmd/extproc` | the scheduler as an Envoy external processor |
-| `cmd/simbackend` | model-server simulator (KV cache, batching, prefix cache, vLLM metrics) |
-| `cmd/loadgen`, `internal/workload` | replayable load generator |
-| `internal/scheduler` | the four policies and the load score |
-| `internal/prefix` | block hashing and the per-replica prefix index |
-| `internal/backend` | replica state and the metrics scraper |
-| `internal/queue` | critical-first, weighted fair queue |
+| `cmd/gateway` | the gateway |
+| `cmd/extproc` | scheduler as an Envoy external processor |
+| `cmd/simbackend` | model server simulator (KV cache, batching, prefix cache, vLLM-style metrics) |
+| `cmd/loadgen`, `internal/workload` | load generator |
+| `internal/scheduler` | the four policies |
+| `internal/prefix` | block hashing and per-replica prefix index |
+| `internal/backend` | replica state and metrics scraper |
+| `internal/queue` | fair queue |
 | `internal/gateway` | request pipeline, spillover, budgets, admin API |
-| `ui/` | the live routing dashboard (static) |
+| `ui/` | dashboard |
 | `deploy/` | compose, Grafana, Kubernetes, Envoy |
 
-Tests: `go test -race ./...` (unit tests for every package plus an in-process integration test that runs simulated replicas behind the gateway and checks prefix routing, shedding, spillover and queueing). CI runs the tests, a 10-second benchmark, and the image build.
+`go test -race ./...` runs unit tests for each package plus an integration test that spins up simulated replicas behind the gateway in-process and checks prefix routing, shedding, spillover and queueing.
 
-## Limitations
+## Caveats
 
-- The simulator is calibrated to the shape of real servers (prefill vs decode, batch slowdown, KV admission, prefix caching), not to any specific GPU. Absolute numbers are simulated milliseconds; the comparisons between policies are the point.
-- The prefix index is the gateway's belief about a replica's cache, not the cache itself; under eviction pressure some predicted hits miss. The benchmark reports the replicas' actual hit ratios alongside the gateway's.
-- At low load `prefix_aware` concentrates each prompt family on one replica rather than spreading; that is intended (it is what makes the cache hit), and load takes over once a replica's score passes 0.8.
-- Spend accounting lives in memory per gateway instance; a shared store is the obvious next step for multiple gateways.
+- The simulator models the shape of a real server (prefill vs decode, batch slowdown, KV admission, prefix cache) but isn't calibrated to any particular GPU. Compare the policies to each other, not the absolute milliseconds.
+- The prefix index is the gateway's guess at what each replica has cached. Under eviction pressure some predicted hits miss; the benchmark reports the replicas' real hit ratios next to the gateway's.
+- At low load, `prefix_aware` concentrates each prompt family on one replica instead of spreading. That's intentional (it's what produces the cache hits); load takes over once a replica's score passes 0.8.
+- Spend tracking is in memory per gateway process. Running more than one gateway would need a shared store.
