@@ -1,0 +1,9 @@
+global:
+  scrape_interval: 2s
+scrape_configs:
+  - job_name: herd
+    static_configs:
+      - targets: ["gateway:8080"]
+  - job_name: replicas
+    static_configs:
+      - targets: ["sim-1:9001", "sim-2:9001", "sim-3:9001", "sim-4:9001", "sim-5:9001", "sim-6:9001", "sim-7:9001", "sim-8:9001"]

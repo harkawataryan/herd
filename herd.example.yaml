@@ -1,0 +1,49 @@
+# Herd gateway configuration. Copy to herd.yaml and edit.
+listen: ":8080"
+
+# round_robin | least_queue | kv_aware | prefix_aware
+policy: prefix_aware
+
+# How often to scrape each replica's /metrics for KV-cache and queue gauges.
+scrape_interval_ms: 500
+# Load score (0..1) at or above which a replica counts as saturated.
+saturation_threshold: 0.9
+# Serve the routing UI from this directory (optional).
+ui_dir: ui
+default_max_tokens: 128
+
+# Your own model servers: vLLM, llama.cpp server, Ollama, or the simulator.
+backends:
+  - name: sim-1
+    url: http://127.0.0.1:9001
+    models: [llama-3-8b]
+    kv_capacity: 32768
+    max_batch: 16
+  - name: sim-2
+    url: http://127.0.0.1:9002
+    models: [llama-3-8b]
+    kv_capacity: 32768
+    max_batch: 16
+  - name: sim-3
+    url: http://127.0.0.1:9003
+    models: [llama-3-8b]
+    kv_capacity: 32768
+    max_batch: 16
+
+# Hosted providers used only when local capacity is saturated (or for
+# models no local replica serves). Prices are USD per million tokens.
+providers:
+  - name: openai
+    url: https://api.openai.com
+    models: [gpt-4o-mini]
+    model_map: {llama-3-8b: gpt-4o-mini}
+    price_in_per_m: 0.15
+    price_out_per_m: 0.60
+    api_key_env: OPENAI_API_KEY
+
+# API keys map to tenants; budget caps cloud spend per tenant.
+tenants:
+  - name: demo
+    api_key: demo-key
+    weight: 1
+    budget_usd: 5.0

@@ -1,0 +1,6 @@
+bin/
+bench/bin/
+bench/results/*.json
+*.log
+herd.yaml
+.env

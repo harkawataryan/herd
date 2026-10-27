@@ -1,0 +1,7 @@
+apiVersion: 1
+providers:
+  - name: herd
+    folder: Herd
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards

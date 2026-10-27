@@ -1,0 +1,50 @@
+# Local stack: the gateway in front of eight simulated replicas and one
+# mock cloud provider, with Prometheus and Grafana for the dashboards.
+#   docker compose -f deploy/compose/docker-compose.yml up --build
+# Gateway: http://localhost:8080  Grafana: http://localhost:3000 (admin/admin)
+
+x-sim: &sim
+  build:
+    context: ../..
+  entrypoint: ["simbackend"]
+  restart: unless-stopped
+
+services:
+  gateway:
+    build:
+      context: ../..
+    command: ["-config", "/etc/herd/herd.yaml"]
+    volumes:
+      - ./herd.yaml:/etc/herd/herd.yaml:ro
+    ports:
+      - "8080:8080"
+    depends_on: [sim-1, sim-2, sim-3, sim-4, sim-5, sim-6, sim-7, sim-8, cloud]
+
+  sim-1: { <<: *sim, command: ["-addr", ":9001", "-name", "sim-1", "-seed", "1", "-time-scale", "0.1"] }
+  sim-2: { <<: *sim, command: ["-addr", ":9001", "-name", "sim-2", "-seed", "2", "-time-scale", "0.1"] }
+  sim-3: { <<: *sim, command: ["-addr", ":9001", "-name", "sim-3", "-seed", "3", "-time-scale", "0.1"] }
+  sim-4: { <<: *sim, command: ["-addr", ":9001", "-name", "sim-4", "-seed", "4", "-time-scale", "0.1"] }
+  sim-5: { <<: *sim, command: ["-addr", ":9001", "-name", "sim-5", "-seed", "5", "-time-scale", "0.1"] }
+  sim-6: { <<: *sim, command: ["-addr", ":9001", "-name", "sim-6", "-seed", "6", "-time-scale", "0.1"] }
+  sim-7: { <<: *sim, command: ["-addr", ":9001", "-name", "sim-7", "-seed", "7", "-time-scale", "0.1"] }
+  sim-8: { <<: *sim, command: ["-addr", ":9001", "-name", "sim-8", "-seed", "8", "-time-scale", "0.1"] }
+  cloud: { <<: *sim, command: ["-addr", ":9001", "-name", "cloud-mock", "-mode", "cloud", "-models", "gpt-4o-mini", "-time-scale", "0.1"] }
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on: [prometheus]
