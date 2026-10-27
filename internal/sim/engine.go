@@ -48,7 +48,9 @@ func (c *Config) defaults() {
 		c.BatchPenalty = 0.15
 	}
 	if c.PrefixCacheBlocks == 0 {
-		c.PrefixCacheBlocks = c.KVCapacity / 2 / prefix.BlockTokens
+		// Like vLLM: freed KV blocks stay cached until the space is needed, so
+		// the prefix cache is as large as the KV cache itself.
+		c.PrefixCacheBlocks = c.KVCapacity / prefix.BlockTokens
 	}
 	if c.TimeScale == 0 {
 		c.TimeScale = 1

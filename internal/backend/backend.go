@@ -54,8 +54,14 @@ func NewReplica(name, url string, kind Kind, models []string) *Replica {
 	for _, m := range models {
 		r.Models[m] = true
 	}
-	r.Prefix = prefix.NewIndex(r.KVCapacity / 2 / prefix.BlockTokens)
+	r.Prefix = prefix.NewIndex(r.KVCapacity / prefix.BlockTokens)
 	return r
+}
+
+// SetKVCapacity resizes the capacity and the prefix index to match the server.
+func (r *Replica) SetKVCapacity(tokens int) {
+	r.KVCapacity = tokens
+	r.Prefix = prefix.NewIndex(tokens / prefix.BlockTokens)
 }
 
 // State is a consistent snapshot for the scheduler and the admin API.

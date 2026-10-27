@@ -1,0 +1,68 @@
+# Envoy fronting the replicas directly, with Herd's scheduler attached as an
+# external processor. Envoy buffers each request body, asks the processor
+# where it should go, and the ORIGINAL_DST cluster forwards it to the host
+# and port the processor put in x-gateway-destination-endpoint.
+#
+#   envoy -c deploy/envoy/envoy.yaml      (extproc on 127.0.0.1:9002)
+static_resources:
+  listeners:
+    - name: ingress
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 10000 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress
+                route_config:
+                  name: local
+                  virtual_hosts:
+                    - name: all
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route:
+                            cluster: replicas
+                            timeout: 0s
+                http_filters:
+                  - name: envoy.filters.http.ext_proc
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+                      failure_mode_allow: false
+                      message_timeout: 15s
+                      processing_mode:
+                        request_header_mode: SEND
+                        request_body_mode: BUFFERED
+                        response_header_mode: SEND
+                        response_body_mode: NONE
+                      grpc_service:
+                        envoy_grpc:
+                          cluster_name: herd_extproc
+                        timeout: 15s
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: herd_extproc
+      type: STRICT_DNS
+      connect_timeout: 1s
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: herd_extproc
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 9002 }
+    - name: replicas
+      type: ORIGINAL_DST
+      lb_policy: CLUSTER_PROVIDED
+      connect_timeout: 2s
+      original_dst_lb_config:
+        use_http_header: true
+        http_header_name: x-gateway-destination-endpoint

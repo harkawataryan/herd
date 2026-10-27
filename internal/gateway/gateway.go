@@ -101,7 +101,10 @@ func (g *Gateway) Register(mux *http.ServeMux) {
 }
 
 func (g *Gateway) tenant(r *http.Request) config.Tenant {
-	key := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	return g.tenantByKey(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+}
+
+func (g *Gateway) tenantByKey(key string) config.Tenant {
 	if t, ok := g.tenants[key]; ok {
 		return t
 	}
@@ -109,7 +112,11 @@ func (g *Gateway) tenant(r *http.Request) config.Tenant {
 }
 
 func criticalityOf(r *http.Request) Criticality {
-	switch Criticality(strings.ToLower(r.Header.Get("X-Criticality"))) {
+	return parseCriticality(r.Header.Get("X-Criticality"))
+}
+
+func parseCriticality(v string) Criticality {
+	switch Criticality(strings.ToLower(v)) {
 	case Critical:
 		return Critical
 	case Sheddable:
@@ -117,6 +124,25 @@ func criticalityOf(r *http.Request) Criticality {
 	default:
 		return Standard
 	}
+}
+
+// NewRecord starts a decision record for callers outside the HTTP handler
+// (the Envoy external processor).
+func (g *Gateway) NewRecord(apiKey, model, crit string, promptTokens int) DecisionRecord {
+	return DecisionRecord{Time: time.Now(), ID: fmt.Sprintf("req-%d", g.next()), Tenant: g.tenantByKey(apiKey).Name,
+		Model: model, Criticality: parseCriticality(crit), Policy: g.policy.Name(), PromptTokens: promptTokens}
+}
+
+// Decide runs the routing logic for a request identified by API key and
+// criticality header value, without proxying it.
+func (g *Gateway) Decide(ctx context.Context, req scheduler.Request, apiKey, crit string, rec *DecisionRecord) (*backend.Replica, string, bool) {
+	return g.route(ctx, req, g.tenantByKey(apiKey), parseCriticality(crit), rec)
+}
+
+// Record stores a finished (or rejected) decision for the admin API.
+func (g *Gateway) Record(rec DecisionRecord, status int, ttftMs, totalMs float64, tokens int) {
+	rec.Status, rec.TTFTMs, rec.TotalMs, rec.Tokens = status, ttftMs, totalMs, tokens
+	g.record(rec)
 }
 
 func (g *Gateway) chat(w http.ResponseWriter, r *http.Request) {

@@ -40,7 +40,7 @@ func main() {
 	for _, b := range cfg.Backends {
 		r := backend.NewReplica(b.Name, b.URL, backend.Local, b.Models)
 		if b.KVCapacity > 0 {
-			r.KVCapacity = b.KVCapacity
+			r.SetKVCapacity(b.KVCapacity)
 		}
 		if b.MaxBatch > 0 {
 			r.MaxBatch = b.MaxBatch

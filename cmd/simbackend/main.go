@@ -20,7 +20,7 @@ func main() {
 	flag.Float64Var(&cfg.PrefillTPS, "prefill-tps", 4000, "prefill tokens per second")
 	flag.Float64Var(&cfg.DecodeTPS, "decode-tps", 40, "decode tokens per second per sequence")
 	flag.Float64Var(&cfg.BatchPenalty, "batch-penalty", 0.15, "decode slowdown fraction per extra sequence")
-	flag.IntVar(&cfg.PrefixCacheBlocks, "prefix-blocks", 0, "prefix cache capacity in blocks (default: half the KV cache)")
+	flag.IntVar(&cfg.PrefixCacheBlocks, "prefix-blocks", 0, "prefix cache capacity in blocks (default: the whole KV cache)")
 	flag.Float64Var(&cfg.TimeScale, "time-scale", 1, "scale simulated time (0.1 = 10x faster)")
 	flag.StringVar(&cfg.Mode, "mode", "local", "local (capacity-bound) or cloud (unbounded, priced)")
 	flag.Float64Var(&cfg.CloudTTFTMs, "cloud-ttft-ms", 600, "cloud mode: mean time to first token")
