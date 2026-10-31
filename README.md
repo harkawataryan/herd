@@ -77,7 +77,7 @@ Other ways to run it:
 - `deploy/k8s/herd.yaml` has a StatefulSet for replicas, a Deployment for the gateway, and an HPA (CPU by default, `hpa-queue.yaml` for queue depth via prometheus-adapter). Written for kind; I haven't run it on a managed cluster.
 - `bin/extproc -config herd.yaml` then `envoy -c deploy/envoy/envoy.yaml`.
 
-## Benchmarks
+## Running the benchmarks
 
 ```bash
 bench/run.sh
