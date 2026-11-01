@@ -21,7 +21,6 @@ import (
 	"github.com/harkawataryan/herd/internal/proxy"
 	"github.com/harkawataryan/herd/internal/queue"
 	"github.com/harkawataryan/herd/internal/scheduler"
-	"github.com/harkawataryan/herd/internal/value"
 )
 
 const maxBody = 4 << 20
@@ -48,13 +47,7 @@ type DecisionRecord struct {
 	Kind         backend.Kind       `json:"kind"`
 	Reason       string             `json:"reason"`
 	Scores       map[string]float64 `json:"scores,omitempty"`
-	Costs        map[string]float64 `json:"costs,omitempty"`
-	Waits        map[string]float64 `json:"waits,omitempty"`
-	Inflight     map[string]int     `json:"inflight,omitempty"`
 	PrefixBlocks int                `json:"prefix_blocks"`
-	EvictCost    float64            `json:"evict_cost"` // expected future hits this placement evicts
-	Protected    float64            `json:"protected"`  // eviction cost avoided vs. plain prefix/load routing
-	Session      string             `json:"session,omitempty"`
 	PromptTokens int                `json:"prompt_tokens"`
 	Status       int                `json:"status"`
 	TTFTMs       float64            `json:"ttft_ms"`
@@ -69,7 +62,6 @@ type Gateway struct {
 	reg    *backend.Registry
 	policy scheduler.Policy
 	thr    scheduler.Thresholds
-	vals   *value.Tracker
 
 	tenants map[string]config.Tenant // api key -> tenant
 	spend   map[string]float64       // tenant -> USD spent on cloud
@@ -81,9 +73,8 @@ type Gateway struct {
 	seq    uint64
 }
 
-func New(cfg *config.Config, reg *backend.Registry, policyName string, thr scheduler.Thresholds) *Gateway {
-	vals := value.New(time.Duration(cfg.ValueHalfLifeMs)*time.Millisecond, time.Duration(cfg.SessionGapMs)*time.Millisecond)
-	g := &Gateway{cfg: cfg, reg: reg, policy: scheduler.New(policyName, thr, vals), thr: thr, vals: vals, tenants: map[string]config.Tenant{}, spend: map[string]float64{}}
+func New(cfg *config.Config, reg *backend.Registry, policy scheduler.Policy, thr scheduler.Thresholds) *Gateway {
+	g := &Gateway{cfg: cfg, reg: reg, policy: policy, thr: thr, tenants: map[string]config.Tenant{}, spend: map[string]float64{}}
 	weights := map[string]int{}
 	for _, t := range cfg.Tenants {
 		g.tenants[t.APIKey] = t
@@ -96,54 +87,9 @@ func New(cfg *config.Config, reg *backend.Registry, policyName string, thr sched
 	return g
 }
 
-// Run starts the queue dispatcher and session expiry; it returns when ctx ends.
+// Run starts the queue dispatcher; it returns when ctx ends.
 func (g *Gateway) Run(ctx context.Context) {
-	gap := time.Duration(g.cfg.SessionGapMs) * time.Millisecond
-	go func() {
-		t := time.NewTicker(gap)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				g.vals.Expire(20 * gap)
-				if pk, ok := g.policy.(*scheduler.Pack); ok {
-					pk.Expire(time.Duration(g.cfg.ValueHalfLifeMs) * time.Millisecond * 4)
-				}
-			}
-		}
-	}()
 	g.queue.Run(ctx, 50*time.Millisecond)
-}
-
-// Policy is the scheduling policy in use.
-func (g *Gateway) Policy() scheduler.Policy { return g.policy }
-
-// Values exposes the block value tracker (for tests and the admin API).
-func (g *Gateway) Values() *value.Tracker { return g.vals }
-
-// sessionOf returns the conversation a request belongs to: the client's
-// X-Session-ID header if present, otherwise the session whose previous
-// prompt this one extends.
-func (g *Gateway) sessionOf(header string, chain []uint64) string {
-	if header != "" {
-		return header
-	}
-	return g.vals.Infer(chain)
-}
-
-// dispatched does the bookkeeping for a request that is about to be sent to
-// a local replica: the mirror of that replica's prefix cache learns the
-// chain now rather than when the response ends, so a request arriving a
-// moment later with the same prefix is routed to the replica that will
-// hold it.
-func (g *Gateway) dispatched(target *backend.Replica, req scheduler.Request) {
-	g.vals.Observe(req.Chain)
-	if target.Kind == backend.Local {
-		target.Prefix.Add(req.Chain)
-	}
-	g.vals.BeginTurn(req.SessionID, target.Name, req.Chain)
 }
 
 func (g *Gateway) Register(mux *http.ServeMux) {
@@ -190,21 +136,12 @@ func (g *Gateway) NewRecord(apiKey, model, crit string, promptTokens int) Decisi
 // Decide runs the routing logic for a request identified by API key and
 // criticality header value, without proxying it.
 func (g *Gateway) Decide(ctx context.Context, req scheduler.Request, apiKey, crit string, rec *DecisionRecord) (*backend.Replica, string, bool) {
-	if req.SessionID == "" {
-		req.SessionID = g.vals.Infer(req.Chain)
-	}
-	rec.Session = req.SessionID
-	target, reason, ok := g.route(ctx, req, g.tenantByKey(apiKey), parseCriticality(crit), rec)
-	if ok {
-		g.dispatched(target, req)
-	}
-	return target, reason, ok
+	return g.route(ctx, req, g.tenantByKey(apiKey), parseCriticality(crit), rec)
 }
 
 // Record stores a finished (or rejected) decision for the admin API.
 func (g *Gateway) Record(rec DecisionRecord, status int, ttftMs, totalMs float64, tokens int) {
 	rec.Status, rec.TTFTMs, rec.TotalMs, rec.Tokens = status, ttftMs, totalMs, tokens
-	g.vals.EndTurn(rec.Session)
 	g.record(rec)
 }
 
@@ -230,12 +167,10 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request) {
 	if maxTokens <= 0 {
 		maxTokens = g.cfg.DefaultMaxTokens
 	}
-	chain := prefix.Chain(prompt)
-	sreq := scheduler.Request{Model: req.Model, Chain: chain, PromptTokens: openai.EstimateTokens(prompt), MaxTokens: maxTokens,
-		SessionID: g.sessionOf(r.Header.Get("X-Session-ID"), chain)}
+	sreq := scheduler.Request{Model: req.Model, Chain: prefix.Chain(prompt), PromptTokens: openai.EstimateTokens(prompt), MaxTokens: maxTokens}
 
 	rec := DecisionRecord{Time: time.Now(), ID: fmt.Sprintf("req-%d", g.next()), Tenant: tenant.Name, Model: req.Model,
-		Criticality: crit, Policy: g.policy.Name(), PromptTokens: sreq.PromptTokens, Session: sreq.SessionID}
+		Criticality: crit, Policy: g.policy.Name(), PromptTokens: sreq.PromptTokens}
 
 	target, reason, ok := g.route(r.Context(), sreq, tenant, crit, &rec)
 	if !ok {
@@ -255,28 +190,14 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	target.Begin(sreq.PromptTokens + maxTokens)
-	g.dispatched(target, sreq)
-	if target.Kind == backend.Local {
-		// The server inserts the prompt into its cache when prefill ends, so
-		// refresh the mirror's recency order at that moment too: between
-		// dispatch and first token other requests may have been served.
-		opt.OnFirstToken = func() { target.Prefix.Add(sreq.Chain) }
-	}
 	w.Header().Set("X-Herd-Backend", target.Name)
 	w.Header().Set("X-Herd-Reason", rec.Reason)
-	w.Header().Set("X-Herd-Prefix-Blocks", fmt.Sprint(rec.PrefixBlocks))
-
-	if sreq.SessionID != "" {
-		w.Header().Set("X-Herd-Session", sreq.SessionID)
-	}
 	res := proxy.Do(r.Context(), w, body, req.Stream, target.URL, opt)
 	target.End(res.TTFT, res.Status == 200 && res.Err == nil)
-	target.Release(sreq.PromptTokens + maxTokens)
-	if res.Status == 200 && res.Err == nil {
-		target.Observe(res.Duration, sreq.PromptTokens+res.CompletionTokens)
-	}
-	g.vals.EndTurn(sreq.SessionID)
 	g.queue.Kick()
+	if target.Kind == backend.Local && res.Status == 200 {
+		target.Prefix.Add(sreq.Chain)
+	}
 
 	rec.Status, rec.TTFTMs, rec.TotalMs, rec.Tokens = res.Status, ms(res.TTFT), ms(res.Duration), res.CompletionTokens
 	if target.Kind == backend.Cloud {
@@ -365,11 +286,6 @@ func (g *Gateway) spill(rec *DecisionRecord, p *backend.Replica, reason string) 
 
 func (g *Gateway) applyDecision(rec *DecisionRecord, d scheduler.Decision, reasonOverride string) {
 	rec.Backend, rec.Kind, rec.Reason, rec.Scores, rec.PrefixBlocks = d.Replica.Name, backend.Local, d.Reason, d.Scores, d.PrefixBlocks
-	rec.EvictCost, rec.Protected = d.EvictCost, d.Protected
-	rec.Costs, rec.Waits, rec.Inflight = d.Costs, d.Waits, d.Inflight
-	if d.Protected > 0 {
-		metrics.Protected.WithLabelValues(g.policy.Name()).Add(d.Protected)
-	}
 	if reasonOverride != "" {
 		rec.Reason = reasonOverride
 	}
@@ -412,8 +328,8 @@ func (g *Gateway) next() uint64 {
 func (g *Gateway) record(rec DecisionRecord) {
 	g.ringMu.Lock()
 	g.ring = append(g.ring, rec)
-	if len(g.ring) > 5000 {
-		g.ring = g.ring[len(g.ring)-5000:]
+	if len(g.ring) > 500 {
+		g.ring = g.ring[len(g.ring)-500:]
 	}
 	g.ringMu.Unlock()
 }
@@ -460,7 +376,7 @@ func (g *Gateway) adminBackends(w http.ResponseWriter, _ *http.Request) {
 		spend[k] = v
 	}
 	g.spendMu.Unlock()
-	writeJSON(w, 200, map[string]any{"policy": g.policy.Name(), "backends": rows, "spend_usd": spend, "queue": map[string]int{"standard": s, "critical": c}, "value": g.vals.Stats()})
+	writeJSON(w, 200, map[string]any{"policy": g.policy.Name(), "backends": rows, "spend_usd": spend, "queue": map[string]int{"standard": s, "critical": c}})
 }
 
 func (g *Gateway) adminDecisions(w http.ResponseWriter, r *http.Request) {
@@ -472,7 +388,7 @@ func (g *Gateway) adminDecisions(w http.ResponseWriter, r *http.Request) {
 	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
 		out[i], out[j] = out[j], out[i]
 	}
-	if len(out) > 100 && r.URL.Query().Get("all") == "" {
+	if len(out) > 100 {
 		out = out[:100]
 	}
 	writeJSON(w, 200, out)

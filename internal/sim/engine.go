@@ -119,10 +119,6 @@ func (e *Engine) Stats() Stats {
 type Request struct {
 	Prompt    string
 	MaxTokens int
-	// OnPrefill, if set, is called once admission is through and the prefix
-	// cache has been consulted, before any token is produced. Servers use it
-	// to put the hit count in response headers.
-	OnPrefill func(cachedBlocks int)
 }
 
 // Result reports the timing the simulator produced.
@@ -228,9 +224,6 @@ func (e *Engine) Generate(ctx context.Context, req Request, emit func(token stri
 		uncached = 0
 	}
 	res.CachedBlocks = hit
-	if req.OnPrefill != nil {
-		req.OnPrefill(hit)
-	}
 	if err := e.sleep(ctx, time.Duration(float64(uncached)/e.cfg.PrefillTPS*float64(time.Second))); err != nil {
 		release(0)
 		return res, err

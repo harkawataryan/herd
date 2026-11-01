@@ -11,7 +11,6 @@ RESULTS="${BENCH_RESULTS:-$BENCH_DIR/results}"
 BENCH_RPS="${BENCH_RPS:-7}"             # simulated requests/second, ~85% of measured capacity
 BENCH_DURATION="${BENCH_DURATION:-120s}" # simulated seconds of traffic per policy
 BENCH_SEED="${BENCH_SEED:-1}"
-BENCH_SEEDS="${BENCH_SEEDS:-$BENCH_SEED}"   # several seeds: results are averaged
 TIME_SCALE="${TIME_SCALE:-0.05}"
 # Default workload: shared-context chat, i.e. a pool of large system prompts
 # (RAG context, few-shot examples) with short user turns, the shape where
@@ -20,9 +19,8 @@ LOADGEN_ARGS="${LOADGEN_ARGS:--system-chars 20000 -system-prompts 20 -mix short=
 GATEWAY_PORT="${GATEWAY_PORT:-18080}"
 SIM_BASE="${SIM_BASE:-19000}"       # replicas listen on SIM_BASE+1 .. SIM_BASE+8
 CLOUD_PORT="${CLOUD_PORT:-19101}"
-POLICIES="${POLICIES:-round_robin least_queue kv_aware prefix_aware llmd_style dynamo_style pack}"
+POLICIES="${POLICIES:-round_robin least_queue kv_aware prefix_aware}"
 REPLICAS=8
-SIM_KV="${SIM_KV:-32768}"           # KV tokens per replica (the prefix cache is the same size)
 
 PIDS=()
 cleanup() {
@@ -61,8 +59,8 @@ start_sims() {
   assert_free "$GATEWAY_PORT"; assert_free "$CLOUD_PORT"
   for i in $(seq 1 $REPLICAS); do assert_free $((SIM_BASE + i)); done
   for i in $(seq 1 $REPLICAS); do
-    local kv=$SIM_KV prefill=4000 decode=40
-    if [[ "$hetero" == "hetero" && $i -ge 7 ]]; then kv=$((SIM_KV / 2)); prefill=2000; decode=20; fi
+    local kv=32768 prefill=4000 decode=40
+    if [[ "$hetero" == "hetero" && $i -ge 7 ]]; then kv=16384; prefill=2000; decode=20; fi
     "$BIN/simbackend" -addr "127.0.0.1:$((SIM_BASE + i))" -name "sim-$i" -kv-capacity $kv -prefill-tps $prefill -decode-tps $decode \
       -time-scale "$TIME_SCALE" -seed $i >"$RESULTS/sim-$i.log" 2>&1 &
     PIDS+=($!)
@@ -79,24 +77,15 @@ write_config() {
   local hetero="${1:-}" cfg="$BENCH_DIR/herd.bench.yaml"
   {
     echo "listen: \":$GATEWAY_PORT\""
-    echo "policy: pack"
+    echo "policy: prefix_aware"
     # 50 ms wall = 1 simulated second at time-scale 0.05: fresh enough for routing.
     echo "scrape_interval_ms: 50"
     echo "saturation_threshold: 0.9"
     echo "default_max_tokens: 128"
-    # evict_aware's clocks, in wall ms: 60 simulated seconds of popularity
-    # half-life and a 3-second default think time between an agent's turns.
-    echo "value_half_life_ms: $(python3 -c "print(int(60000*$TIME_SCALE))")"
-    echo "session_gap_ms: $(python3 -c "print(int(3000*$TIME_SCALE))")"
-    # The sims prefill 4000 tokens per simulated second; in the gateway's wall
-    # clock that is 4000/TIME_SCALE.
-    echo "prefill_tps: $(python3 -c "print(int(4000/$TIME_SCALE))")"
-    # EXTRA_CONFIG: extra top-level YAML lines for experiments.
-    [[ -n "${EXTRA_CONFIG:-}" ]] && printf '%s\n' "$EXTRA_CONFIG"
     echo "backends:"
     for i in $(seq 1 $REPLICAS); do
-      local kv=$SIM_KV
-      if [[ "$hetero" == "hetero" && $i -ge 7 ]]; then kv=$((SIM_KV / 2)); fi
+      local kv=32768
+      if [[ "$hetero" == "hetero" && $i -ge 7 ]]; then kv=16384; fi
       printf '  - {name: sim-%d, url: http://127.0.0.1:%d, models: [llama-3-8b], kv_capacity: %d, max_batch: 16}\n' $i $((SIM_BASE + i)) $kv
     done
     cat <<EOF
@@ -116,25 +105,19 @@ EOF
   echo "$cfg"
 }
 
-# run_policy <policy> <config> <tag>: for each seed, start a gateway, replay
-# the workload, stop it. The simulated replicas keep their caches between
-# runs, so each run starts by draining them to keep policies comparable.
+# run_policy <policy> <config> <tag>: start a gateway, replay the workload, stop it.
 run_policy() {
   local policy="$1" cfg="$2" tag="$3"
-  for seed in $BENCH_SEEDS; do
-    "$BIN/gateway" -config "$cfg" -policy "$policy" -listen "127.0.0.1:$GATEWAY_PORT" >"$RESULTS/gateway-$tag-$policy-$seed.log" 2>&1 &
-    local gw=$!
-    wait_for "http://127.0.0.1:$GATEWAY_PORT/healthz"
-    # Let the first scrape land so load-aware policies start with real gauges.
-    sleep 0.3
-    "$BIN/loadgen" -url "http://127.0.0.1:$GATEWAY_PORT" -rps "$BENCH_RPS" -duration "$BENCH_DURATION" -seed "$seed" \
-      -time-scale "$TIME_SCALE" -policy-label "$policy" -out "$RESULTS/$tag-$policy-$seed.json" -samples "$RESULTS/$tag-$policy-$seed.samples.jsonl" $LOADGEN_ARGS \
-      2>"$RESULTS/loadgen-$tag-$policy-$seed.log" | tail -1 | sed "s/^| $policy /| $policy (seed $seed) /"
-    curl -s "http://127.0.0.1:$GATEWAY_PORT/metrics" | grep -E '^herd_(decisions|protected|prefix_blocks)' >"$RESULTS/$tag-$policy-$seed.metrics" || true
-    curl -s "http://127.0.0.1:$GATEWAY_PORT/admin/decisions?all=1" >"$RESULTS/$tag-$policy-$seed.decisions.json" || true
-    kill $gw 2>/dev/null || true
-    wait $gw 2>/dev/null || true
-  done
+  "$BIN/gateway" -config "$cfg" -policy "$policy" -listen "127.0.0.1:$GATEWAY_PORT" >"$RESULTS/gateway-$tag-$policy.log" 2>&1 &
+  local gw=$!
+  wait_for "http://127.0.0.1:$GATEWAY_PORT/healthz"
+  # Let the first scrape land so load-aware policies start with real gauges.
+  sleep 0.3
+  "$BIN/loadgen" -url "http://127.0.0.1:$GATEWAY_PORT" -rps "$BENCH_RPS" -duration "$BENCH_DURATION" -seed "$BENCH_SEED" \
+    -time-scale "$TIME_SCALE" -policy-label "$policy" -out "$RESULTS/$tag-$policy.json" $LOADGEN_ARGS \
+    2>"$RESULTS/loadgen-$tag-$policy.log" | tee "$RESULTS/$tag-$policy.md"
+  kill $gw 2>/dev/null || true
+  wait $gw 2>/dev/null || true
 }
 
 # write_table <tag> <outfile>: one row per policy from the saved markdown rows.
@@ -143,9 +126,13 @@ write_table() {
   {
     echo "# Herd benchmark ($tag)"
     echo
-    echo "Workload: rps=$BENCH_RPS duration=$BENCH_DURATION seed=$BENCH_SEED time_scale=$TIME_SCALE replicas=$REPLICAS kv=$SIM_KV loadgen_args='$LOADGEN_ARGS'. Latencies are in simulated milliseconds; goodput is the share of all requests answered with TTFT under 2 s; cache hit is the share of prompt blocks the servers reported as prefix-cache hits. Generated $(date -u +%Y-%m-%dT%H:%M:%SZ)."
+    echo "Workload: rps=$BENCH_RPS duration=$BENCH_DURATION seed=$BENCH_SEED time_scale=$TIME_SCALE replicas=$REPLICAS loadgen_args='$LOADGEN_ARGS'. Latencies are in simulated milliseconds. Generated $(date -u +%Y-%m-%dT%H:%M:%SZ)."
     echo
-    python3 "$BENCH_DIR/table.py" "$RESULTS" "$tag" $POLICIES
+    local first=1
+    for p in $POLICIES; do
+      if [[ $first -eq 1 ]]; then head -2 "$RESULTS/$tag-$p.md"; first=0; fi
+      tail -1 "$RESULTS/$tag-$p.md"
+    done
   } >"$out"
   echo
   cat "$out"

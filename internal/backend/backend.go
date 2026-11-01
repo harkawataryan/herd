@@ -39,7 +39,6 @@ type Replica struct {
 
 	mu                sync.Mutex
 	inflight          int
-	inflightTokens    int // prompt + reserved output of every request dispatched and not yet finished
 	tokensSinceScrape int
 	kv                float64
 	running, waiting  int
@@ -47,8 +46,6 @@ type Replica struct {
 	healthy           bool
 	scrapeErr         string
 	ewmaTTFT          float64 // seconds
-	ewmaDuration      float64 // seconds, whole request
-	ewmaTokens        float64 // prompt + completion tokens per request
 	completed         int64
 }
 
@@ -69,32 +66,28 @@ func (r *Replica) SetKVCapacity(tokens int) {
 
 // State is a consistent snapshot for the scheduler and the admin API.
 type State struct {
-	Name           string  `json:"name"`
-	Kind           Kind    `json:"kind"`
-	Healthy        bool    `json:"healthy"`
-	Inflight       int     `json:"inflight"`
-	InflightTokens int     `json:"inflight_tokens"`
-	KV             float64 `json:"kv_scraped"`
-	KVEstimate     float64 `json:"kv_estimate"`
-	Running        int     `json:"running"`
-	Waiting        int     `json:"waiting"`
-	MaxBatch       int     `json:"max_batch"`
-	EWMATTFTMs     float64 `json:"ewma_ttft_ms"`
-	EWMADurMs      float64 `json:"ewma_duration_ms"`
-	EWMATokens     float64 `json:"ewma_tokens"`
-	ScrapeAge      float64 `json:"scrape_age_s"`
-	ScrapeErr      string  `json:"scrape_error,omitempty"`
-	Completed      int64   `json:"completed"`
-	PrefixLen      int     `json:"prefix_blocks_indexed"`
+	Name       string  `json:"name"`
+	Kind       Kind    `json:"kind"`
+	Healthy    bool    `json:"healthy"`
+	Inflight   int     `json:"inflight"`
+	KV         float64 `json:"kv_scraped"`
+	KVEstimate float64 `json:"kv_estimate"`
+	Running    int     `json:"running"`
+	Waiting    int     `json:"waiting"`
+	MaxBatch   int     `json:"max_batch"`
+	EWMATTFTMs float64 `json:"ewma_ttft_ms"`
+	ScrapeAge  float64 `json:"scrape_age_s"`
+	ScrapeErr  string  `json:"scrape_error,omitempty"`
+	Completed  int64   `json:"completed"`
+	PrefixLen  int     `json:"prefix_blocks_indexed"`
 }
 
 func (r *Replica) State() State {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	st := State{
-		Name: r.Name, Kind: r.Kind, Healthy: r.healthy, Inflight: r.inflight, InflightTokens: r.inflightTokens, KV: r.kv,
+		Name: r.Name, Kind: r.Kind, Healthy: r.healthy, Inflight: r.inflight, KV: r.kv,
 		Running: r.running, Waiting: r.waiting, MaxBatch: r.MaxBatch, EWMATTFTMs: r.ewmaTTFT * 1000,
-		EWMADurMs: r.ewmaDuration * 1000, EWMATokens: r.ewmaTokens,
 		ScrapeErr: r.scrapeErr, Completed: r.completed, PrefixLen: r.Prefix.Len(),
 	}
 	if !r.lastScrape.IsZero() {
@@ -102,10 +95,7 @@ func (r *Replica) State() State {
 	}
 	// Scrapes are periodic; tokens dispatched since the last one haven't shown
 	// up in the replica's own gauge yet, so add them to avoid stale decisions.
-	// The gateway's own ledger of in-flight tokens is a floor: a request it
-	// has sent that is still queued at the server is not in the gauge at all,
-	// but it will take KV before anything sent later does.
-	st.KVEstimate = max(r.kv+float64(r.tokensSinceScrape)/float64(r.KVCapacity), float64(r.inflightTokens)/float64(r.KVCapacity))
+	st.KVEstimate = r.kv + float64(r.tokensSinceScrape)/float64(r.KVCapacity)
 	if st.KVEstimate > 1 {
 		st.KVEstimate = 1
 	}
@@ -116,15 +106,7 @@ func (r *Replica) State() State {
 func (r *Replica) Begin(tokens int) {
 	r.mu.Lock()
 	r.inflight++
-	r.inflightTokens += tokens
 	r.tokensSinceScrape += tokens
-	r.mu.Unlock()
-}
-
-// Release returns the tokens reserved by Begin once the request is over.
-func (r *Replica) Release(tokens int) {
-	r.mu.Lock()
-	r.inflightTokens = max(0, r.inflightTokens-tokens)
 	r.mu.Unlock()
 }
 
@@ -143,28 +125,6 @@ func (r *Replica) End(ttft time.Duration, ok bool) {
 		}
 	}
 	r.mu.Unlock()
-}
-
-// Observe folds a completed request's duration and size into the replica's
-// running averages, which the scheduler uses to estimate how long a new
-// request would wait for a batch slot or KV room.
-func (r *Replica) Observe(total time.Duration, tokens int) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if total > 0 {
-		if r.ewmaDuration == 0 {
-			r.ewmaDuration = total.Seconds()
-		} else {
-			r.ewmaDuration = 0.8*r.ewmaDuration + 0.2*total.Seconds()
-		}
-	}
-	if tokens > 0 {
-		if r.ewmaTokens == 0 {
-			r.ewmaTokens = float64(tokens)
-		} else {
-			r.ewmaTokens = 0.8*r.ewmaTokens + 0.2*float64(tokens)
-		}
-	}
 }
 
 // Serves reports whether the replica can take the model; an empty model

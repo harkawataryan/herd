@@ -41,11 +41,6 @@ type Config struct {
 	SpillThreshold      float64    `yaml:"spill_threshold"`
 	MaxQueueWaitMs      int        `yaml:"max_queue_wait_ms"`
 	DefaultMaxTokens    int        `yaml:"default_max_tokens"`
-	ValueHalfLifeMs     int        `yaml:"value_half_life_ms"` // pack: block popularity halves after this much inactivity
-	SessionGapMs        int        `yaml:"session_gap_ms"`     // pack: assumed gap between turns until a session shows its own
-	EvictWeight         float64    `yaml:"evict_weight"`       // pack: prefill blocks one expected future hit is worth (default 1)
-	PrefillTPS          float64    `yaml:"prefill_tps"`        // pack: servers' prompt-processing rate, tokens/s (default 4000)
-	PackSlackBlocks     float64    `yaml:"pack_slack_blocks"`  // pack: extra cost accepted to keep a conversation or family in place (default 8)
 	UIDir               string     `yaml:"ui_dir"`
 	Backends            []Backend  `yaml:"backends"`
 	Providers           []Provider `yaml:"providers"`
@@ -70,7 +65,7 @@ func (c *Config) Defaults() {
 		c.Listen = ":8080"
 	}
 	if c.Policy == "" {
-		c.Policy = "pack"
+		c.Policy = "prefix_aware"
 	}
 	if c.ScrapeIntervalMs == 0 {
 		c.ScrapeIntervalMs = 500
@@ -86,21 +81,6 @@ func (c *Config) Defaults() {
 	}
 	if c.DefaultMaxTokens == 0 {
 		c.DefaultMaxTokens = 128
-	}
-	if c.ValueHalfLifeMs == 0 {
-		c.ValueHalfLifeMs = 60000
-	}
-	if c.SessionGapMs == 0 {
-		c.SessionGapMs = 5000
-	}
-	if c.EvictWeight == 0 {
-		c.EvictWeight = 1
-	}
-	if c.PrefillTPS == 0 {
-		c.PrefillTPS = 4000
-	}
-	if c.PackSlackBlocks == 0 {
-		c.PackSlackBlocks = 8
 	}
 	for i := range c.Tenants {
 		if c.Tenants[i].Weight == 0 {

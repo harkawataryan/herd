@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/harkawataryan/herd/internal/openai"
-	"github.com/harkawataryan/herd/internal/prefix"
 	"github.com/harkawataryan/herd/internal/workload"
 )
 
@@ -32,11 +31,7 @@ func main() {
 	flag.IntVar(&p.SystemPrompts, "system-prompts", p.SystemPrompts, "distinct system prompts in the pool")
 	flag.IntVar(&p.SystemPromptChars, "system-chars", p.SystemPromptChars, "mean system prompt size in chars")
 	flag.Float64Var(&p.Zipf, "zipf", p.Zipf, "system prompt popularity skew (>1)")
-	mix := flag.String("mix", "short=0.4,rag=0.4,long=0.2", "arrival class fractions (an agent arrival starts a multi-turn session)")
-	flag.IntVar(&p.AgentTurns, "agent-turns", p.AgentTurns, "mean turns per agent session")
-	flag.DurationVar(&p.AgentGap, "agent-gap", p.AgentGap, "mean simulated think time between an agent's turns")
-	flag.IntVar(&p.AgentToolChars, "agent-tool-chars", p.AgentToolChars, "tool output appended to the conversation each turn")
-	sloMs := flag.Float64("slo-ttft-ms", 2000, "goodput counts requests whose TTFT (simulated ms) is within this")
+	mix := flag.String("mix", "short=0.4,rag=0.4,long=0.2", "request class fractions")
 	crit := flag.String("criticality", "standard=0.7,sheddable=0.2,critical=0.1", "criticality fractions")
 	timeScale := flag.Float64("time-scale", 1, "scale arrival intervals (match the sims' -time-scale)")
 	concurrency := flag.Int("concurrency", 0, "closed-loop mode: N workers back to back, ignoring arrival times")
@@ -73,20 +68,18 @@ func main() {
 		}
 	}
 	sum := trace.Summarize()
-	log.Printf("trace: %d requests (%d sessions) over %s sim time, classes=%v crit=%v mean prompt tokens=%.0f top prompt share=%.0f%%",
-		sum.Requests, sum.Sessions, trace.Params.Duration, sum.ByClass, sum.ByCrit, sum.MeanPromptTk, 100*sum.ZipfShare())
+	log.Printf("trace: %d requests over %s sim time, classes=%v crit=%v mean prompt tokens=%.0f top prompt share=%.0f%%",
+		sum.Requests, trace.Params.Duration, sum.ByClass, sum.ByCrit, sum.MeanPromptTk, 100*sum.ZipfShare())
 
 	samples := fire(*url, trace, *timeScale, *concurrency)
 	wall := time.Duration(float64(trace.Params.Duration) * *timeScale)
-	report := summarize(*label, samples, wall, trace.Params.Duration, *timeScale, *sloMs)
+	report := summarize(*label, samples, wall, trace.Params.Duration, *timeScale)
 
 	fmt.Println(report.MarkdownHeader())
 	fmt.Println(report.MarkdownRow())
 	log.Printf("backend share: %v", report.ByBackend)
 	log.Printf("shed by criticality: %v", report.ShedByCrit)
 	log.Printf("p99 TTFT by class (ms): %v", report.TTFTByClassMs)
-	log.Printf("server-measured cache hit: %.1f%% of prompt blocks (gateway predicted %.1f%%, mean error %.1f blocks); goodput %.1f%% within %.0f ms",
-		report.HitBlockPct, report.PredictedHitPct, report.MirrorErrBlocks, report.GoodputPct, *sloMs)
 
 	if *out != "" {
 		b, _ := json.MarshalIndent(report, "", "  ")
@@ -134,61 +127,30 @@ func fire(url string, trace *workload.Trace, timeScale float64, concurrency int)
 		return samples
 	}
 
-	// Sessions are dependent chains: turn k+1 can only be sent once turn k
-	// has been answered and the agent has "thought" for its gap.
-	sessions := map[string][]int{}
-	for i, r := range trace.Requests {
-		if r.Session != "" {
-			sessions[r.Session] = append(sessions[r.Session], i)
-		}
-	}
-
 	start := time.Now()
 	for i, r := range trace.Requests {
-		if r.Session != "" && r.Turn > 0 {
-			continue
-		}
 		at := time.Duration(float64(r.At) * timeScale)
 		if d := time.Until(start.Add(at)); d > 0 {
 			time.Sleep(d)
 		}
 		wg.Add(1)
-		if r.Session == "" {
-			go func(i int) {
-				defer wg.Done()
-				samples[i] = send(client, url, trace.Requests[i])
-			}(i)
-			continue
-		}
-		go func(turns []int) {
+		go func(i int, r workload.Request) {
 			defer wg.Done()
-			for _, j := range turns {
-				t := trace.Requests[j]
-				if t.Turn > 0 {
-					time.Sleep(time.Duration(float64(t.Gap) * timeScale))
-				}
-				samples[j] = send(client, url, t)
-			}
-		}(sessions[r.Session])
+			samples[i] = send(client, url, r)
+		}(i, r)
 	}
 	wg.Wait()
 	return samples
 }
 
 func send(client *http.Client, url string, r workload.Request) Sample {
-	s := Sample{Seq: r.Seq, Tenant: r.Tenant, Class: string(r.Class), Criticality: r.Criticality, Session: r.Session, Turn: r.Turn, SystemIdx: r.SystemIdx,
-		PromptBlocks: len(prefix.Chain(r.PromptText()))}
+	s := Sample{Seq: r.Seq, Tenant: r.Tenant, Class: string(r.Class), Criticality: r.Criticality}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, "POST", url+"/v1/chat/completions", bytes.NewReader(r.Body()))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+r.APIKey)
 	req.Header.Set("X-Criticality", r.Criticality)
-	// Sessions identify themselves, as a well-behaved agent client would.
-	// (The gateway can also infer them from the prompt prefix.)
-	if r.Session != "" {
-		req.Header.Set("X-Session-ID", r.Session)
-	}
 	start := time.Now()
 	resp, err := client.Do(req)
 	if err != nil {
@@ -199,11 +161,6 @@ func send(client *http.Client, url string, r workload.Request) Sample {
 	s.Status = resp.StatusCode
 	s.Backend = resp.Header.Get("X-Herd-Backend")
 	s.Reason = resp.Header.Get("X-Herd-Reason")
-	fmt.Sscanf(resp.Header.Get("X-Herd-Prefix-Blocks"), "%d", &s.PredictedBlocks)
-	if v := resp.Header.Get("X-Sim-Cached-Blocks"); v != "" {
-		fmt.Sscanf(v, "%d", &s.CachedBlocks)
-		s.HasCacheInfo = true
-	}
 	if resp.StatusCode != 200 {
 		s.Total = time.Since(start)
 		return s

@@ -89,7 +89,6 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	flusher, _ := w.(http.Flusher)
-	sreq.OnPrefill = func(cached int) { w.Header().Set("X-Sim-Cached-Blocks", fmt.Sprint(cached)) }
 	emit := func(t string) {
 		b, _ := json.Marshal(openai.ChatChunk{ID: id, Object: "chat.completion.chunk", Created: created, Model: req.Model,
 			Choices: []openai.ChunkChoice{{Delta: openai.Delta{Content: t}}}})

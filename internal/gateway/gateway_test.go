@@ -58,7 +58,7 @@ func newHarness(t *testing.T, policy string, replicas int, simCfg sim.Config, wi
 	thr := scheduler.DefaultThresholds()
 	ctx, cancel := context.WithCancel(context.Background())
 	go reg.Run(ctx, 20*time.Millisecond)
-	gw := New(cfg, reg, policy, thr)
+	gw := New(cfg, reg, scheduler.New(policy, thr), thr)
 	go gw.Run(ctx)
 	mux := http.NewServeMux()
 	gw.Register(mux)
@@ -172,72 +172,5 @@ func TestStandardWaitsInQueueWithoutBudget(t *testing.T) {
 	wg.Wait()
 	if resp.StatusCode != 200 || !strings.HasPrefix(resp.Header.Get("X-Herd-Reason"), "queued_then_") {
 		t.Fatalf("standard request should queue then dispatch, got %d via %s", resp.StatusCode, resp.Header.Get("X-Herd-Reason"))
-	}
-}
-
-// chatSession sends a multi-turn request with the given history and session id.
-func (h *harness) chatSession(session, system string, history []string, user string) (*http.Response, string) {
-	var msgs []string
-	msgs = append(msgs, fmt.Sprintf(`{"role":"system","content":%q}`, system))
-	for i, m := range history {
-		role := "user"
-		if i%2 == 1 {
-			role = "assistant"
-		}
-		msgs = append(msgs, fmt.Sprintf(`{"role":%q,"content":%q}`, role, m))
-	}
-	msgs = append(msgs, fmt.Sprintf(`{"role":"user","content":%q}`, user))
-	body := fmt.Sprintf(`{"model":"m","max_tokens":8,"messages":[%s]}`, strings.Join(msgs, ","))
-	req, _ := http.NewRequest("POST", h.srv.URL+"/v1/chat/completions", strings.NewReader(body))
-	req.Header.Set("Authorization", "Bearer k")
-	if session != "" {
-		req.Header.Set("X-Session-ID", session)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		h.t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	var buf strings.Builder
-	b := make([]byte, 4096)
-	for {
-		n, err := resp.Body.Read(b)
-		buf.Write(b[:n])
-		if err != nil {
-			break
-		}
-	}
-	return resp, buf.String()
-}
-
-func TestPackKeepsAConversationOnItsReplica(t *testing.T) {
-	h := newHarness(t, "pack", 3, fast(), false, 0)
-	system := strings.Repeat("You are a careful assistant. ", 60)
-	// Turn 0, with an explicit session id.
-	r0, _ := h.chatSession("conv-1", system, nil, "first question")
-	home := r0.Header.Get("X-Herd-Backend")
-	if r0.StatusCode != 200 || home == "" {
-		t.Fatalf("turn 0: status %d backend %q", r0.StatusCode, home)
-	}
-	// Turn 1 extends the prompt with the reply and a tool result.
-	hist := []string{"first question", strings.Repeat("the reply and a tool result ", 40)}
-	r1, _ := h.chatSession("conv-1", system, hist, "second question")
-	if got := r1.Header.Get("X-Herd-Backend"); got != home {
-		t.Fatalf("turn 1 went to %s, want %s (reason %s)", got, home, r1.Header.Get("X-Herd-Reason"))
-	}
-	if reason := r1.Header.Get("X-Herd-Reason"); reason != "session_home" {
-		t.Fatalf("turn 1 reason = %s, want session_home", reason)
-	}
-	// Turn 2 without the header: the session is inferred from the prefix.
-	hist = append(hist, "second question", strings.Repeat("another reply ", 40))
-	r2, _ := h.chatSession("", system, hist, "third question")
-	if got := r2.Header.Get("X-Herd-Backend"); got != home {
-		t.Fatalf("turn 2 went to %s, want %s", got, home)
-	}
-	if sess := r2.Header.Get("X-Herd-Session"); sess != "conv-1" {
-		t.Fatalf("turn 2 session = %q, want conv-1 (inferred)", sess)
-	}
-	if st := h.gw.Values().Stats(); st.ActiveSessions != 1 {
-		t.Fatalf("active sessions = %d, want 1", st.ActiveSessions)
 	}
 }
