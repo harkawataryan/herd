@@ -22,6 +22,7 @@ const (
 	Short Class = "short" // chat turn, ~200 chars of user text
 	RAG   Class = "rag"   // retrieved context, 8–16k chars
 	Long  Class = "long"  // long document, ~32k chars
+	Agent Class = "agent" // a multi-turn session: each turn's prompt is the previous one plus the reply and a tool result
 )
 
 type Tenant struct {
@@ -43,6 +44,14 @@ type Params struct {
 	Zipf              float64            `json:"zipf"`                // popularity skew exponent (>1)
 	RPS               float64            `json:"rps"`
 	Duration          time.Duration      `json:"duration"`
+
+	// Agent sessions. An arrival of class Agent starts a session of several
+	// turns; the next turn is sent AgentGap after the previous one completes
+	// (the time the agent spends on a tool call), and its prompt is the
+	// previous prompt plus the assistant's reply and the tool's output.
+	AgentTurns     int           `json:"agent_turns"`      // mean turns per session (uniform between half and 1.5x)
+	AgentGap       time.Duration `json:"agent_gap"`        // mean think time between turns, exponential
+	AgentToolChars int           `json:"agent_tool_chars"` // tool output appended per turn
 }
 
 func DefaultParams() Params {
@@ -56,12 +65,15 @@ func DefaultParams() Params {
 		},
 		Mix:               map[Class]float64{Short: 0.4, RAG: 0.4, Long: 0.2},
 		Criticality:       map[string]float64{"standard": 0.7, "sheddable": 0.2, "critical": 0.1},
-		MaxTokens:         map[Class]int{Short: 64, RAG: 128, Long: 128},
+		MaxTokens:         map[Class]int{Short: 64, RAG: 128, Long: 128, Agent: 128},
 		SystemPrompts:     30,
 		SystemPromptChars: 3000,
 		Zipf:              1.1,
 		RPS:               10,
 		Duration:          60 * time.Second,
+		AgentTurns:        5,
+		AgentGap:          3 * time.Second,
+		AgentToolChars:    1500,
 	}
 }
 
@@ -79,6 +91,23 @@ type Request struct {
 	System      string        `json:"-"`
 	User        string        `json:"user"`
 	MaxTokens   int           `json:"max_tokens"`
+
+	// Session fields, empty for one-off requests. Turn 0 fires at At; later
+	// turns fire Gap after the previous turn completes. History holds the
+	// earlier user and assistant messages of the conversation.
+	Session string           `json:"session,omitempty"`
+	Turn    int              `json:"turn,omitempty"`
+	Gap     time.Duration    `json:"gap,omitempty"`
+	History []openai.Message `json:"history,omitempty"`
+}
+
+// Messages is the conversation as sent: system prompt, prior turns, then
+// the new user message.
+func (r Request) Messages() []openai.Message {
+	msgs := make([]openai.Message, 0, len(r.History)+2)
+	msgs = append(msgs, openai.Message{Role: "system", Content: r.System})
+	msgs = append(msgs, r.History...)
+	return append(msgs, openai.Message{Role: "user", Content: r.User})
 }
 
 // Body is the OpenAI chat request the gateway receives.
@@ -87,16 +116,19 @@ func (r Request) Body() []byte {
 		"model":      r.Model,
 		"stream":     true,
 		"max_tokens": r.MaxTokens,
-		"messages": []openai.Message{
-			{Role: "system", Content: r.System},
-			{Role: "user", Content: r.User},
-		},
+		"messages":   r.Messages(),
 	})
 	return b
 }
 
+// PromptText is the flattened prompt exactly as the gateway hashes it.
+func (r Request) PromptText() string {
+	req := openai.ChatRequest{Messages: r.Messages()}
+	return req.PromptText()
+}
+
 // PromptChars is the approximate prompt size, for capacity planning.
-func (r Request) PromptChars() int { return len(r.System) + len(r.User) + 16 }
+func (r Request) PromptChars() int { return len(r.PromptText()) }
 
 // Trace is a generated workload plus the prompt pool it references.
 type Trace struct {
@@ -126,7 +158,8 @@ func Generate(p Params) *Trace {
 
 	var reqs []Request
 	var at time.Duration
-	for seq := 0; ; seq++ {
+	seq, sessions := 0, 0
+	for arrival := 0; ; arrival++ {
 		// Poisson arrivals: exponential inter-arrival times.
 		at += time.Duration(rng.ExpFloat64() / p.RPS * float64(time.Second))
 		if at > p.Duration {
@@ -135,10 +168,38 @@ func Generate(p Params) *Trace {
 		cls := classes[pick(rng, classW)]
 		t := p.Tenants[pick(rng, tenantW)]
 		sys := int(zipf.Uint64())
-		reqs = append(reqs, Request{
-			Seq: seq, At: at, Tenant: t.Name, APIKey: t.APIKey, Class: cls, Criticality: crits[pick(rng, critW)],
-			Model: p.Model, SystemIdx: sys, System: pool[sys], User: userText(rng, cls, seq), MaxTokens: p.MaxTokens[cls],
-		})
+		base := Request{
+			At: at, Tenant: t.Name, APIKey: t.APIKey, Class: cls, Criticality: crits[pick(rng, critW)],
+			Model: p.Model, SystemIdx: sys, System: pool[sys], MaxTokens: p.MaxTokens[cls],
+		}
+		if cls != Agent {
+			base.Seq, base.User = seq, userText(rng, cls, seq)
+			reqs = append(reqs, base)
+			seq++
+			continue
+		}
+		// A session: the same arrival spawns several dependent turns.
+		sessions++
+		turns := max(1, p.AgentTurns/2+rng.Intn(max(1, p.AgentTurns)))
+		id := fmt.Sprintf("s%d", sessions)
+		var history []openai.Message
+		for turn := 0; turn < turns; turn++ {
+			r := base
+			r.Seq, r.Session, r.Turn = seq, id, turn
+			r.User = text(rng, 200, fmt.Sprintf("Session %s turn %d. ", id, turn))
+			r.History = append([]openai.Message(nil), history...)
+			if turn > 0 {
+				r.Gap = time.Duration(rng.ExpFloat64() * float64(p.AgentGap))
+			}
+			reqs = append(reqs, r)
+			seq++
+			// What the client will send back next time: this turn, the reply it
+			// got (the simulator's output length), and the tool result it ran.
+			reply := text(rng, r.MaxTokens*4, fmt.Sprintf("Reply %s/%d. ", id, turn))
+			tool := text(rng, p.AgentToolChars, fmt.Sprintf("Tool result %s/%d. ", id, turn))
+			history = append(history, openai.Message{Role: "user", Content: r.User},
+				openai.Message{Role: "assistant", Content: reply + "\n[tool result] " + tool})
+		}
 	}
 	return &Trace{Params: p, Pool: pool, Requests: reqs}
 }
@@ -251,6 +312,7 @@ type Summary struct {
 	TopPrompts   map[int]int    `json:"top_prompts"` // index -> count for the 5 most popular
 	PromptTokens int            `json:"prompt_tokens_total"`
 	MeanPromptTk float64        `json:"mean_prompt_tokens"`
+	Sessions     int            `json:"sessions"`
 }
 
 func (t *Trace) Summarize() Summary {
@@ -262,7 +324,10 @@ func (t *Trace) Summarize() Summary {
 		s.ByCrit[r.Criticality]++
 		s.ByTenant[r.Tenant]++
 		counts[r.SystemIdx]++
-		s.PromptTokens += openai.EstimateTokens(r.System) + openai.EstimateTokens(r.User)
+		s.PromptTokens += openai.EstimateTokens(r.PromptText())
+		if r.Session != "" && r.Turn == 0 {
+			s.Sessions++
+		}
 	}
 	if s.Requests > 0 {
 		s.MeanPromptTk = float64(s.PromptTokens) / float64(s.Requests)

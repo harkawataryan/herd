@@ -60,10 +60,11 @@ func main() {
 	}
 	t := scheduler.DefaultThresholds()
 	t.Saturated = cfg.SaturationThreshold
+	t.EvictWeight, t.PrefillTPS, t.PackSlack = cfg.EvictWeight, cfg.PrefillTPS, cfg.PackSlackBlocks
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go reg.Run(ctx, time.Duration(cfg.ScrapeIntervalMs)*time.Millisecond)
-	gw := gateway.New(cfg, reg, scheduler.New(cfg.Policy, t), t)
+	gw := gateway.New(cfg, reg, cfg.Policy, t)
 	go gw.Run(ctx)
 
 	lis, err := net.Listen("tcp", *addr)

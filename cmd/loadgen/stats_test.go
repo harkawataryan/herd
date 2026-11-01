@@ -27,7 +27,7 @@ func TestSummarize(t *testing.T) {
 		{Status: 200, Backend: "cloud", Reason: "spillover_saturated", TTFT: 600 * time.Millisecond, Total: 3 * time.Second, Tokens: 10, Criticality: "critical", Class: "rag"},
 		{Status: 503, Criticality: "sheddable", Class: "rag"},
 	}
-	r := summarize("test", samples, 10*time.Second, 100*time.Second, 0.1)
+	r := summarize("test", samples, 10*time.Second, 100*time.Second, 0.1, 2000)
 	if r.OK != 3 || r.Shed != 1 || r.Requests != 4 {
 		t.Fatalf("counts wrong: %+v", r)
 	}

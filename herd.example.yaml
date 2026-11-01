@@ -1,8 +1,8 @@
 # Herd gateway configuration. Copy to herd.yaml and edit.
 listen: ":8080"
 
-# round_robin | least_queue | kv_aware | prefix_aware
-policy: prefix_aware
+# round_robin | least_queue | kv_aware | prefix_aware | llmd_style | dynamo_style | pack
+policy: pack
 
 # How often to scrape each replica's /metrics for KV-cache and queue gauges.
 scrape_interval_ms: 500
@@ -11,6 +11,18 @@ saturation_threshold: 0.9
 # Serve the routing UI from this directory (optional).
 ui_dir: ui
 default_max_tokens: 128
+
+# pack policy. prefill_tps is your servers' prompt-processing rate, used to
+# express an expected wait in prefill blocks (4000 is a small model on one
+# modern GPU). pack_slack_blocks is how much extra cost the policy accepts
+# to keep a conversation or prompt family on the replica that holds it.
+# value_half_life_ms is how fast a prompt's popularity fades; session_gap_ms
+# is the assumed time between an agent's turns until it shows its own.
+prefill_tps: 4000
+pack_slack_blocks: 8
+evict_weight: 1
+value_half_life_ms: 60000
+session_gap_ms: 5000
 
 # Your own model servers: vLLM, llama.cpp server, Ollama, or the simulator.
 backends:

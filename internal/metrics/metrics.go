@@ -51,4 +51,7 @@ var (
 	PrefixHits = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "herd_prefix_blocks_total", Help: "Prompt blocks routed to a replica expected to have them cached vs not",
 	}, []string{"outcome"})
+	Protected = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "herd_protected_value_total", Help: "Expected future cache hits saved by routing around valuable cached blocks (pack)",
+	}, []string{"policy"})
 )

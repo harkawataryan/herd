@@ -21,7 +21,7 @@ import (
 
 func main() {
 	cfgPath := flag.String("config", "herd.yaml", "config file")
-	policyFlag := flag.String("policy", "", "override policy: round_robin | least_queue | kv_aware | prefix_aware")
+	policyFlag := flag.String("policy", "", "override policy: round_robin | least_queue | kv_aware | prefix_aware | llmd_style | dynamo_style | pack")
 	listen := flag.String("listen", "", "override listen address")
 	flag.Parse()
 
@@ -59,7 +59,8 @@ func main() {
 
 	t := scheduler.DefaultThresholds()
 	t.Saturated = cfg.SaturationThreshold
-	policy := scheduler.New(cfg.Policy, t)
+	t.EvictWeight, t.PrefillTPS, t.PackSlack = cfg.EvictWeight, cfg.PrefillTPS, cfg.PackSlackBlocks
+	policy := cfg.Policy
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -74,7 +75,7 @@ func main() {
 		mux.Handle("GET /", http.FileServer(http.Dir(cfg.UIDir)))
 	}
 
-	log.Printf("herd listening on %s policy=%s backends=%d providers=%d", cfg.Listen, policy.Name(), len(cfg.Backends), len(cfg.Providers))
+	log.Printf("herd listening on %s policy=%s backends=%d providers=%d", cfg.Listen, gw.Policy().Name(), len(cfg.Backends), len(cfg.Providers))
 	srv := &http.Server{Addr: cfg.Listen, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	log.Fatal(srv.ListenAndServe())
 }

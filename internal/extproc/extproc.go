@@ -49,6 +49,7 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 		if err != nil {
 			if chosen != nil {
 				chosen.End(0, false)
+				chosen.Release(tokens)
 			}
 			return err
 		}
@@ -111,6 +112,7 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 					}},
 				}}}}); err != nil {
 				chosen.End(0, false)
+				chosen.Release(tokens)
 				return err
 			}
 
@@ -123,6 +125,7 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 			}
 			if chosen != nil {
 				chosen.End(0, status == 200)
+				chosen.Release(tokens)
 				chosen = nil
 			}
 			if err := stream.Send(&extprocv3.ProcessingResponse{Response: &extprocv3.ProcessingResponse_ResponseHeaders{

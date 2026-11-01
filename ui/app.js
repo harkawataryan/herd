@@ -34,7 +34,8 @@
   function reasonFamily(reason, status) {
     if (status === 503 || /shed|no_budget|no_backend/.test(reason)) return 'danger';
     if (/spillover|cloud_only|critical_least/.test(reason)) return 'warn';
-    if (/prefix_hit/.test(reason)) return 'accent';
+    if (/prefix_hit|family_hit|session_home/.test(reason)) return 'accent';
+    if (/evict_|family_expand/.test(reason)) return 'cool';
     return '';
   }
 
@@ -55,6 +56,9 @@
     const total = spend.reduce((s, [, v]) => s + v, 0);
     $('st-spend').textContent = '$' + total.toFixed(2);
     $('st-spend').title = spend.map(([t, v]) => `${t}: $${v.toFixed(4)}`).join('\n');
+    const val = data.value || {};
+    $('st-sessions').textContent = val.active_sessions != null ? val.active_sessions : '–';
+    $('st-sessions').title = `${val.tracked_blocks || 0} prompt blocks with a popularity estimate`;
   }
 
   function fillClass(x) {

@@ -38,6 +38,9 @@ var Client = &http.Client{
 type Options struct {
 	Model  string // rewritten model id for providers that use different names
 	APIKey string // bearer token for providers; empty leaves the client's header alone
+	// OnFirstToken, if set, runs when the first token arrives, i.e. when the
+	// server has finished prefill and written the prompt into its cache.
+	OnFirstToken func()
 }
 
 // Do forwards body to targetURL/v1/chat/completions and copies the response
@@ -84,6 +87,9 @@ func Do(ctx context.Context, w http.ResponseWriter, body []byte, stream bool, ta
 			return res
 		}
 		res.TTFT = time.Since(start)
+		if opt.OnFirstToken != nil {
+			opt.OnFirstToken()
+		}
 		var full openai.ChatResponse
 		if json.Unmarshal(data, &full) == nil {
 			res.PromptTokens, res.CompletionTokens = full.Usage.PromptTokens, full.Usage.CompletionTokens
@@ -106,6 +112,9 @@ func Do(ctx context.Context, w http.ResponseWriter, body []byte, stream bool, ta
 					if first {
 						res.TTFT = time.Since(start)
 						first = false
+						if opt.OnFirstToken != nil {
+							opt.OnFirstToken()
+						}
 					}
 					res.CompletionTokens++
 				}
