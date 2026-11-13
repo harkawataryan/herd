@@ -1,0 +1,24 @@
+listen: ":8080"
+policy: prefix_aware
+scrape_interval_ms: 500
+saturation_threshold: 0.9
+ui_dir: /ui
+backends:
+  - { name: sim-1, url: http://sim-1:9001, models: [llama-3-8b] }
+  - { name: sim-2, url: http://sim-2:9001, models: [llama-3-8b] }
+  - { name: sim-3, url: http://sim-3:9001, models: [llama-3-8b] }
+  - { name: sim-4, url: http://sim-4:9001, models: [llama-3-8b] }
+  - { name: sim-5, url: http://sim-5:9001, models: [llama-3-8b] }
+  - { name: sim-6, url: http://sim-6:9001, models: [llama-3-8b] }
+  - { name: sim-7, url: http://sim-7:9001, models: [llama-3-8b] }
+  - { name: sim-8, url: http://sim-8:9001, models: [llama-3-8b] }
+providers:
+  - name: cloud-mock
+    url: http://cloud:9001
+    models: [gpt-4o-mini]
+    model_map: { llama-3-8b: gpt-4o-mini }
+    price_in_per_m: 0.15
+    price_out_per_m: 0.60
+tenants:
+  - { name: demo, api_key: demo-key, weight: 1, budget_usd: 5 }
+  - { name: batch, api_key: batch-key, weight: 1, budget_usd: 0 }

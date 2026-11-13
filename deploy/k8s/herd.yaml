@@ -1,0 +1,130 @@
+# Herd on Kubernetes: four simulated replicas as a StatefulSet (stable DNS
+# names so the gateway config can list them), the gateway as a Deployment
+# behind a Service, and an HPA. Apply with:
+#   kind create cluster --name herd && kind load docker-image herd:local --name herd
+#   kubectl apply -f deploy/k8s/herd.yaml
+#   kubectl -n herd port-forward svc/gateway 8080:8080
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: herd
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sim
+  namespace: herd
+spec:
+  clusterIP: None
+  selector: { app: sim }
+  ports: [{ name: http, port: 9001 }]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sim
+  namespace: herd
+spec:
+  serviceName: sim
+  replicas: 4
+  selector:
+    matchLabels: { app: sim }
+  template:
+    metadata:
+      labels: { app: sim }
+    spec:
+      containers:
+        - name: simbackend
+          image: herd:local
+          imagePullPolicy: IfNotPresent
+          command: ["simbackend"]
+          args: ["-addr", ":9001", "-name", "$(POD_NAME)", "-time-scale", "0.1"]
+          env:
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+          ports: [{ containerPort: 9001 }]
+          readinessProbe:
+            httpGet: { path: /healthz, port: 9001 }
+          resources:
+            requests: { cpu: 50m, memory: 32Mi }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: herd-config
+  namespace: herd
+data:
+  herd.yaml: |
+    listen: ":8080"
+    policy: prefix_aware
+    scrape_interval_ms: 500
+    ui_dir: /ui
+    backends:
+      - { name: sim-0, url: http://sim-0.sim.herd.svc.cluster.local:9001, models: [llama-3-8b] }
+      - { name: sim-1, url: http://sim-1.sim.herd.svc.cluster.local:9001, models: [llama-3-8b] }
+      - { name: sim-2, url: http://sim-2.sim.herd.svc.cluster.local:9001, models: [llama-3-8b] }
+      - { name: sim-3, url: http://sim-3.sim.herd.svc.cluster.local:9001, models: [llama-3-8b] }
+    tenants:
+      - { name: demo, api_key: demo-key, weight: 1, budget_usd: 0 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: herd
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: gateway }
+  template:
+    metadata:
+      labels: { app: gateway }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+    spec:
+      containers:
+        - name: gateway
+          image: herd:local
+          imagePullPolicy: IfNotPresent
+          args: ["-config", "/etc/herd/herd.yaml"]
+          ports: [{ containerPort: 8080 }]
+          volumeMounts:
+            - { name: config, mountPath: /etc/herd }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+          resources:
+            requests: { cpu: 100m, memory: 64Mi }
+            limits: { cpu: "1", memory: 256Mi }
+      volumes:
+        - name: config
+          configMap: { name: herd-config }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  namespace: herd
+spec:
+  selector: { app: gateway }
+  ports: [{ name: http, port: 8080, targetPort: 8080 }]
+---
+# Scales the gateway on CPU out of the box. With prometheus-adapter installed,
+# replace the metric with herd_queue_depth (see deploy/k8s/hpa-queue.yaml).
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: gateway
+  namespace: herd
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: gateway
+  minReplicas: 1
+  maxReplicas: 4
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 70 }

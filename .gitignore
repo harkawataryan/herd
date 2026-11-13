@@ -2,5 +2,6 @@ bin/
 bench/bin/
 bench/results/*.json
 *.log
-herd.yaml
+# your local config at the repo root; the deploy/ configs are part of the repo
+/herd.yaml
 .env
